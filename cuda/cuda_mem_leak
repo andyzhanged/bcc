@@ -1,7 +1,7 @@
 #! /usr/bin/python2
 #
 # memleak   Trace and display outstanding allocations to detect
-#           memory leaks in user-mode processes and the kernel.
+#           cuda memory leaks in user-mode processes.
 #
 # USAGE: memleak [-h] [-p PID] [-t] [-a] [-o OLDER] [-c COMMAND]
 #                [--combined-only] [-s SAMPLE_RATE] [-T TOP] [-z MIN_SIZE]
@@ -9,7 +9,6 @@
 #                [interval] [count]
 #
 # Licensed under the Apache License, Version 2.0 (the "License")
-# Copyright (C) 2016 Sasha Goldshtein.
 
 from bcc import BPF
 from time import sleep
@@ -20,14 +19,14 @@ import subprocess
 import os
 
 class Allocation(object):
-    def __init__(self, stack, size):
-        self.stack = stack
-        self.count = 1
-        self.size = size
+        def __init__(self, stack, size):
+                self.stack = stack
+                self.count = 1
+                self.size = size
 
-    def update(self, size):
-        self.count += 1
-        self.size += size
+        def update(self, size):
+                self.count += 1
+                self.size += size
 
 def run_command_get_output(command):
         p = subprocess.Popen(command.split(),
@@ -38,21 +37,33 @@ def run_command_get_pid(command):
         p = subprocess.Popen(command.split())
         return p.pid
 
+def get_proc_status(pid):
+        for line in open("/proc/%d/status" % pid).readlines():
+                if line.startswith("State:"):
+                        return line.split(":",1)[1].strip().split(' ')[0]
+        return None
+
+def is_proc_exit(pid):
+        status = get_proc_status(pid)
+        if status is None or status == "Z":
+                return True
+        return False
+
 examples = """
 EXAMPLES:
 
-./memleak -p $(pidof allocs)
+./memleak -p $(pidof cuda_app)
         Trace allocations and display a summary of "leaked" (outstanding)
         allocations every 5 seconds
-./memleak -p $(pidof allocs) -t
+./memleak -p $(pidof cuda_app) -t
         Trace allocations and display each individual allocator function call
-./memleak -ap $(pidof allocs) 10
+./memleak -ap $(pidof cuda_app) 10
         Trace allocations and display allocated addresses, sizes, and stacks
         every 10 seconds for outstanding allocations
-./memleak -c "./allocs"
+./memleak -c "./cuda_app"
         Run the specified command and trace its allocations
 ./memleak
-        Trace allocations in kernel mode and display a summary of outstanding
+        Trace allocations in cuda display a summary of outstanding
         allocations every 5 seconds
 ./memleak -o 60000
         Trace allocations in kernel mode and display a summary of outstanding
@@ -62,17 +73,15 @@ EXAMPLES:
 """
 
 description = """
-Trace outstanding memory allocations that weren't freed.
-Supports both user-mode allocations made with libc functions and kernel-mode
-allocations made with kmalloc/kmem_cache_alloc/get_free_pages and corresponding
-memory release functions.
+Trace outstanding cuda memory allocations that weren't freed.
+Supports trace cudaMalloc cudaFree by now.
 """
 
 parser = argparse.ArgumentParser(description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=examples)
 parser.add_argument("-p", "--pid", type=int, default=-1,
-        help="the PID to trace; if not specified, trace kernel allocs")
+        help="the PID to trace")
 parser.add_argument("-t", "--trace", action="store_true",
         help="print trace messages for each alloc/free call")
 parser.add_argument("interval", nargs="?", default=5, type=int,
@@ -95,15 +104,13 @@ parser.add_argument("-z", "--min-size", type=int,
         help="capture only allocations larger than this size")
 parser.add_argument("-Z", "--max-size", type=int,
         help="capture only allocations smaller than this size")
-parser.add_argument("-O", "--obj", type=str, default="c",
-        help="attach to allocator functions in the specified object")
+parser.add_argument("-O", "--obj", type=str, default="/usr/local/corex/lib64/libcudart.so",
+        help="attach to allocator functions in the specified object, default is /usr/local/corex/lib64/libcudart.so")
 
 args = parser.parse_args()
 
 pid = args.pid
 command = args.command
-kernel_trace = (pid == -1 and command is None)
-trace_all = args.trace
 interval = args.interval
 min_age_ns = 1e6 * args.older
 sample_every_n = args.sample_rate
@@ -121,6 +128,7 @@ if command is not None:
         print("Executing '%s' and tracing the resulting process." % command)
         pid = run_command_get_pid(command)
 
+
 bpf_source = """
 #include <uapi/linux/ptrace.h>
 
@@ -136,8 +144,8 @@ struct combined_alloc_info_t {
 };
 
 BPF_HASH(sizes, u64);
+BPF_HASH(cudaMallocPara1, u64);
 BPF_TABLE("hash", u64, struct alloc_info_t, allocs, 1000000);
-BPF_HASH(memptrs, u64, u64);
 BPF_STACK_TRACE(stack_traces, 10240)
 BPF_TABLE("hash", u64, struct combined_alloc_info_t, combined_allocs, 10240);
 
@@ -174,7 +182,7 @@ static inline void update_statistics_del(u64 stack_id, u64 sz) {
         combined_allocs.update(&stack_id, &cinfo);
 }
 
-static inline int gen_alloc_enter(struct pt_regs *ctx, size_t size) {
+static inline int gen_alloc_enter(struct pt_regs *ctx) {
         SIZE_FILTER
         if (SAMPLE_EVERY_N > 1) {
                 u64 ts = bpf_ktime_get_ns();
@@ -182,45 +190,63 @@ static inline int gen_alloc_enter(struct pt_regs *ctx, size_t size) {
                         return 0;
         }
 
-        u64 pid = bpf_get_current_pid_tgid();
-        u64 size64 = size;
-        sizes.update(&pid, &size64);
+	u64 pid_tgid = bpf_get_current_pid_tgid();
+        u64 cpu_ptr = PT_REGS_PARM1(ctx);
+        u64 size = PT_REGS_PARM2(ctx);
+        sizes.update(&pid_tgid, &size);
+	cudaMallocPara1.update(&pid_tgid, &cpu_ptr);
 
         if (SHOULD_PRINT)
-                bpf_trace_printk("alloc entered, size = %u\\n", size);
+                bpf_trace_printk("alloc entered, size = %u, cpu_ptr %lx\\n", size, cpu_ptr);
         return 0;
 }
 
-static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address) {
-        u64 pid = bpf_get_current_pid_tgid();
-        u64* size64 = sizes.lookup(&pid);
+static inline int gen_alloc_exit2(struct pt_regs *ctx) {
         struct alloc_info_t info = {0};
+        u64 pid_tgid = bpf_get_current_pid_tgid();
+        u64* size = sizes.lookup(&pid_tgid);
+        u64 dev_ptr;
 
-        if (size64 == 0)
+        if (PT_REGS_RC(ctx) != 0) /*cudaMalloc failed*/
+                return 0;
+
+        if (size == 0)
                 return 0; // missed alloc entry
+        info.size = *size;
 
-        info.size = *size64;
-        sizes.delete(&pid);
+	u64 *cpu_ptr_temp = cudaMallocPara1.lookup(&pid_tgid);
+        if (cpu_ptr_temp == 0) {
+                sizes.delete(&pid_tgid);
+                return 0;
+        }
+        void *cpu_ptr = (void *)*cpu_ptr_temp;
+        if(bpf_probe_read(&dev_ptr, sizeof(u64), cpu_ptr)){
+                bpf_trace_printk("read cudaMalloc return addr failed from ptr is 0x%lx", cpu_ptr);
+                return 0;
+        }
 
+        cudaMallocPara1.delete(&pid_tgid);
         info.timestamp_ns = bpf_ktime_get_ns();
         info.stack_id = stack_traces.get_stackid(ctx, STACK_FLAGS);
-        allocs.update(&address, &info);
+        allocs.update(&dev_ptr, &info);
         update_statistics_add(info.stack_id, info.size);
 
         if (SHOULD_PRINT) {
-                bpf_trace_printk("alloc exited, size = %lu, result = %lx\\n",
-                                 info.size, address);
+                bpf_trace_printk("cudaMalloc exited, size = %lu, result = %lx\\n",
+                                info.size, dev_ptr);
         }
+
         return 0;
 }
 
 static inline int gen_alloc_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit2(ctx, PT_REGS_RC(ctx));
+        return gen_alloc_exit2(ctx);
 }
 
 static inline int gen_free_enter(struct pt_regs *ctx, void *address) {
         u64 addr = (u64)address;
         struct alloc_info_t *info = allocs.lookup(&addr);
+
         if (info == 0)
                 return 0;
 
@@ -229,217 +255,75 @@ static inline int gen_free_enter(struct pt_regs *ctx, void *address) {
 
         if (SHOULD_PRINT) {
                 bpf_trace_printk("free entered, address = %lx, size = %lu\\n",
-                                 address, info->size);
+                                address, info->size);
         }
         return 0;
 }
 
-int malloc_enter(struct pt_regs *ctx, size_t size) {
-        return gen_alloc_enter(ctx, size);
+int cudaMalloc_enter(struct pt_regs *ctx, size_t size) {
+        return gen_alloc_enter(ctx);
 }
 
-int malloc_exit(struct pt_regs *ctx) {
+int cudaMalloc_exit(struct pt_regs *ctx) {
         return gen_alloc_exit(ctx);
 }
 
-int free_enter(struct pt_regs *ctx, void *address) {
+int cudaFree_enter(struct pt_regs *ctx, void *address) {
         return gen_free_enter(ctx, address);
 }
-
-int calloc_enter(struct pt_regs *ctx, size_t nmemb, size_t size) {
-        return gen_alloc_enter(ctx, nmemb * size);
-}
-
-int calloc_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit(ctx);
-}
-
-int realloc_enter(struct pt_regs *ctx, void *ptr, size_t size) {
-        gen_free_enter(ctx, ptr);
-        return gen_alloc_enter(ctx, size);
-}
-
-int realloc_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit(ctx);
-}
-
-int posix_memalign_enter(struct pt_regs *ctx, void **memptr, size_t alignment,
-                         size_t size) {
-        u64 memptr64 = (u64)(size_t)memptr;
-        u64 pid = bpf_get_current_pid_tgid();
-
-        memptrs.update(&pid, &memptr64);
-        return gen_alloc_enter(ctx, size);
-}
-
-int posix_memalign_exit(struct pt_regs *ctx) {
-        u64 pid = bpf_get_current_pid_tgid();
-        u64 *memptr64 = memptrs.lookup(&pid);
-        void *addr;
-
-        if (memptr64 == 0)
-                return 0;
-
-        memptrs.delete(&pid);
-
-        if (bpf_probe_read(&addr, sizeof(void*), (void*)(size_t)*memptr64))
-                return 0;
-
-        u64 addr64 = (u64)(size_t)addr;
-        return gen_alloc_exit2(ctx, addr64);
-}
-
-int aligned_alloc_enter(struct pt_regs *ctx, size_t alignment, size_t size) {
-        return gen_alloc_enter(ctx, size);
-}
-
-int aligned_alloc_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit(ctx);
-}
-
-int valloc_enter(struct pt_regs *ctx, size_t size) {
-        return gen_alloc_enter(ctx, size);
-}
-
-int valloc_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit(ctx);
-}
-
-int memalign_enter(struct pt_regs *ctx, size_t alignment, size_t size) {
-        return gen_alloc_enter(ctx, size);
-}
-
-int memalign_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit(ctx);
-}
-
-int pvalloc_enter(struct pt_regs *ctx, size_t size) {
-        return gen_alloc_enter(ctx, size);
-}
-
-int pvalloc_exit(struct pt_regs *ctx) {
-        return gen_alloc_exit(ctx);
-}
 """
 
-bpf_source_kernel = """
-
-TRACEPOINT_PROBE(kmem, kmalloc) {
-        gen_alloc_enter((struct pt_regs *)args, args->bytes_alloc);
-        return gen_alloc_exit2((struct pt_regs *)args, (size_t)args->ptr);
-}
-
-TRACEPOINT_PROBE(kmem, kmalloc_node) {
-        gen_alloc_enter((struct pt_regs *)args, args->bytes_alloc);
-        return gen_alloc_exit2((struct pt_regs *)args, (size_t)args->ptr);
-}
-
-TRACEPOINT_PROBE(kmem, kfree) {
-        return gen_free_enter((struct pt_regs *)args, (void *)args->ptr);
-}
-
-TRACEPOINT_PROBE(kmem, kmem_cache_alloc) {
-        gen_alloc_enter((struct pt_regs *)args, args->bytes_alloc);
-        return gen_alloc_exit2((struct pt_regs *)args, (size_t)args->ptr);
-}
-
-TRACEPOINT_PROBE(kmem, kmem_cache_alloc_node) {
-        gen_alloc_enter((struct pt_regs *)args, args->bytes_alloc);
-        return gen_alloc_exit2((struct pt_regs *)args, (size_t)args->ptr);
-}
-
-TRACEPOINT_PROBE(kmem, kmem_cache_free) {
-        return gen_free_enter((struct pt_regs *)args, (void *)args->ptr);
-}
-
-TRACEPOINT_PROBE(kmem, mm_page_alloc) {
-        gen_alloc_enter((struct pt_regs *)args, PAGE_SIZE << args->order);
-        return gen_alloc_exit2((struct pt_regs *)args, args->pfn);
-}
-
-TRACEPOINT_PROBE(kmem, mm_page_free) {
-        return gen_free_enter((struct pt_regs *)args, (void *)args->pfn);
-}
-"""
-
-if kernel_trace:
-        bpf_source += bpf_source_kernel
-
-bpf_source = bpf_source.replace("SHOULD_PRINT", "1" if trace_all else "0")
+bpf_source = bpf_source.replace("SHOULD_PRINT", "1")
 bpf_source = bpf_source.replace("SAMPLE_EVERY_N", str(sample_every_n))
 bpf_source = bpf_source.replace("PAGE_SIZE", str(resource.getpagesize()))
 
 size_filter = ""
 if min_size is not None and max_size is not None:
         size_filter = "if (size < %d || size > %d) return 0;" % \
-                      (min_size, max_size)
+                        (min_size, max_size)
 elif min_size is not None:
         size_filter = "if (size < %d) return 0;" % min_size
 elif max_size is not None:
         size_filter = "if (size > %d) return 0;" % max_size
+
 bpf_source = bpf_source.replace("SIZE_FILTER", size_filter)
 
-stack_flags = "BPF_F_REUSE_STACKID"
-if not kernel_trace:
-        stack_flags += "|BPF_F_USER_STACK"
+stack_flags = "BPF_F_REUSE_STACKID|BPF_F_USER_STACK"
 bpf_source = bpf_source.replace("STACK_FLAGS", stack_flags)
 
 bpf = BPF(text=bpf_source)
+if obj is None:
+        obj = "/usr/local/corex/lib64/libcudart.so"
+if not os.path.exists(obj):
+        print("cuda library %s not exist\n" % obj)
+        exit()
 
-if not kernel_trace:
-        print("Attaching to pid %d, Ctrl+C to quit." % pid)
+print("Attaching to pid %d, Ctrl+C to quit." % pid)
 
-        def attach_probes(sym, fn_prefix=None, can_fail=False):
-                if fn_prefix is None:
-                        fn_prefix = sym
+def attach_probes(sym, fn_prefix=None, can_fail=False):
+        if fn_prefix is None:
+                fn_prefix = sym
 
-                try:
-                        bpf.attach_uprobe(name=obj, sym=sym,
-                                          fn_name=fn_prefix + "_enter",
-                                          pid=pid)
-                        bpf.attach_uretprobe(name=obj, sym=sym,
-                                             fn_name=fn_prefix + "_exit",
-                                             pid=pid)
-                except Exception:
-                        if can_fail:
-                                return
-                        else:
-                                raise
+        try:
+                bpf.attach_uprobe(name=obj, sym=sym,
+                                        fn_name=fn_prefix + "_enter",
+                                        pid=pid)
+                bpf.attach_uretprobe(name=obj, sym=sym,
+                                        fn_name=fn_prefix + "_exit",
+                                        pid=pid)
+        except Exception:
+                if can_fail:
+                        return
+                else:
+                        raise
 
-        attach_probes("malloc")
-        attach_probes("calloc")
-        attach_probes("realloc")
-        attach_probes("posix_memalign")
-        attach_probes("valloc")
-        attach_probes("memalign")
-        attach_probes("pvalloc")
-        attach_probes("aligned_alloc", can_fail=True)  # added in C11
-        bpf.attach_uprobe(name=obj, sym="free", fn_name="free_enter",
-                                  pid=pid)
-
-else:
-        print("Attaching to kernel allocators, Ctrl+C to quit.")
-
-        # No probe attaching here. Allocations are counted by attaching to
-        # tracepoints.
-        #
-        # Memory allocations in Linux kernel are not limited to malloc/free
-        # equivalents. It's also common to allocate a memory page or multiple
-        # pages. Page allocator have two interfaces, one working with page
-        # frame numbers (PFN), while other working with page addresses. It's
-        # possible to allocate pages with one kind of functions, and free them
-        # with another. Code in kernel can easy convert PFNs to addresses and
-        # back, but it's hard to do the same in eBPF kprobe without fragile
-        # hacks.
-        #
-        # Fortunately, Linux exposes tracepoints for memory allocations, which
-        # can be instrumented by eBPF programs. Tracepoint for page allocations
-        # gives access to PFNs for both allocator interfaces. So there is no
-        # need to guess which allocation corresponds to which free.
+attach_probes("cudaMalloc")
+bpf.attach_uprobe(name=obj, sym="cudaFree", fn_name="cudaFree_enter",
+                                pid=pid)
 
 def print_outstanding():
         print("[%s] Top %d stacks with outstanding allocations:" %
-              (datetime.now().strftime("%H:%M:%S"), top_stacks))
+                (datetime.now().strftime("%H:%M:%S"), top_stacks))
         alloc_info = {}
         allocs = bpf["allocs"]
         stack_traces = bpf["stack_traces"]
@@ -456,16 +340,13 @@ def print_outstanding():
                         for addr in stack:
                                 combined.append(bpf.sym(addr, pid,
                                         show_module=True, show_offset=True))
-                        alloc_info[info.stack_id] = Allocation(combined,
-                                                               info.size)
+                        alloc_info[info.stack_id] = Allocation(combined, info.size)
                 if args.show_allocs:
-                        print("\taddr = %x size = %s" %
-                              (address.value, info.size))
-        to_show = sorted(alloc_info.values(),
-                         key=lambda a: a.size)[-top_stacks:]
+                        print("\taddr = %x size = %s" %(address.value, info.size))
+        to_show = sorted(alloc_info.values(), key=lambda a: a.size)[-top_stacks:]
         for alloc in to_show:
                 print("\t%d bytes in %d allocations from stack\n\t\t%s" %
-                      (alloc.size, alloc.count, "\n\t\t".join(alloc.stack)))
+                        (alloc.size, alloc.count, "\n\t\t".join(alloc.stack)))
 
 def print_outstanding_combined():
         stack_traces = bpf["stack_traces"]
@@ -478,15 +359,15 @@ def print_outstanding_combined():
                         trace = []
                         for addr in stack_traces.walk(stack_id.value):
                                 sym = bpf.sym(addr, pid,
-                                                      show_module=True,
-                                                      show_offset=True)
+                                                show_module=True,
+                                                show_offset=True)
                                 trace.append(sym)
                         trace = "\n\t\t".join(trace)
                 except KeyError:
                         trace = "stack information lost"
 
                 entry = ("\t%d bytes in %d allocations from stack\n\t\t%s" %
-                         (info.total_size, info.number_of_allocs, trace))
+                        (info.total_size, info.number_of_allocs, trace))
                 entries.append(entry)
 
                 cnt += 1
@@ -494,23 +375,27 @@ def print_outstanding_combined():
                         break
 
         print("[%s] Top %d stacks with outstanding allocations:" %
-              (datetime.now().strftime("%H:%M:%S"), top_stacks))
-
+                (datetime.now().strftime("%H:%M:%S"), top_stacks))
         print('\n'.join(reversed(entries)))
 
 count_so_far = 0
+
 while True:
-        if trace_all:
-                print(bpf.trace_fields())
+        try:
+                sleep(interval)
+        except KeyboardInterrupt:
+                exit()
+
+        proc_exit = is_proc_exit(pid)
+        if proc_exit is True:
+                print("Traced process exited, check stack above\n")
+                exit()
+
+        if args.combined_only:
+                print_outstanding_combined()
         else:
-                try:
-                        sleep(interval)
-                except KeyboardInterrupt:
-                        exit()
-                if args.combined_only:
-                        print_outstanding_combined()
-                else:
-                        print_outstanding()
-                count_so_far += 1
-                if num_prints is not None and count_so_far >= num_prints:
-                        exit()
+                print_outstanding()
+
+        count_so_far += 1
+        if num_prints is not None and count_so_far >= num_prints:
+                exit()
