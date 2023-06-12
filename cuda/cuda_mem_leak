@@ -271,6 +271,27 @@ int cudaMalloc_exit(struct pt_regs *ctx) {
 int cudaFree_enter(struct pt_regs *ctx, void *address) {
         return gen_free_enter(ctx, address);
 }
+
+int cudaHostAlloc_enter(struct pt_regs *ctx, size_t size) {
+        return gen_alloc_enter(ctx);
+}
+
+int cudaHostAlloc_exit(struct pt_regs *ctx) {
+        return gen_alloc_exit(ctx);
+}
+
+int cudaFreeHost_enter(struct pt_regs *ctx, void *address) {
+        return gen_free_enter(ctx, address);
+}
+
+int cudaMallocHost_enter(struct pt_regs *ctx, size_t size) {
+        return gen_alloc_enter(ctx);
+}
+
+int cudaMallocHost_exit(struct pt_regs *ctx) {
+        return gen_alloc_exit(ctx);
+}
+
 """
 
 bpf_source = bpf_source.replace("SHOULD_PRINT", "1")
@@ -318,9 +339,12 @@ def attach_probes(sym, fn_prefix=None, can_fail=False):
                         raise
 
 attach_probes("cudaMalloc")
+attach_probes("cudaHostAlloc")
+attach_probes("cudaMallocHost")
 bpf.attach_uprobe(name=obj, sym="cudaFree", fn_name="cudaFree_enter",
                                 pid=pid)
-
+bpf.attach_uprobe(name=obj, sym="cudaFreeHost", fn_name="cudaFreeHost_enter",
+                                pid=pid)
 def print_outstanding():
         print("[%s] Top %d stacks with outstanding allocations:" %
                 (datetime.now().strftime("%H:%M:%S"), top_stacks))
