@@ -498,7 +498,7 @@ BPF_PERF_OUTPUT(%s);
                 if self.kernel_stack:
                         self.print_stack(bpf, event.kernel_stack_id, -1)
                 if self.user_stack:
-                        self.print_stack(bpf, event.user_stack_id, event.tgid)
+                        self.print_stack(bpf, event.user_stack_id, Probe.tgid)
                 if self.user_stack or self.kernel_stack:
                         print("")
 
